@@ -9,9 +9,16 @@
 #import <Foundation/Foundation.h>
 #import "SDWebImageCompat.h"
 
+/// Device information helper methods
 @interface SDDeviceHelper : NSObject
 
+#pragma mark - RAM
 + (NSUInteger)totalMemory;
 + (NSUInteger)freeMemory;
+
+#pragma mark - Screen
++ (double)screenScale;
++ (double)screenEDR;
++ (double)screenMaxEDR;
 
 @end

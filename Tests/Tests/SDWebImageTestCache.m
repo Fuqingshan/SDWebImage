@@ -8,7 +8,7 @@
  */
 
 #import "SDWebImageTestCache.h"
-#import <SDWebImage/SDImageCacheConfig.h>
+#import <SDWebImage/SDWebImage.h>
 #import "SDFileAttributeHelper.h"
 
 static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hackemist.SDWebImageTestDiskCache";
@@ -49,7 +49,7 @@ static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hac
 @implementation SDWebImageTestDiskCache
 
 - (nullable NSString *)cachePathForKey:(nonnull NSString *)key {
-    return [self.cachePath stringByAppendingPathComponent:key];
+    return [self.cachePath stringByAppendingPathComponent:key.lastPathComponent];
 }
 
 - (BOOL)containsDataForKey:(nonnull NSString *)key {
@@ -72,7 +72,16 @@ static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hac
 }
 
 - (void)removeAllData {
-    [self.fileManager removeItemAtPath:self.cachePath error:nil];
+    NSURL *srcURL = [NSURL fileURLWithPath:self.cachePath isDirectory:YES];
+    NSDirectoryEnumerator<NSURL *> *fileEnumerator = [self.fileManager enumeratorAtURL:srcURL
+                                                  includingPropertiesForKeys:@[]
+                                                                     options:(NSDirectoryEnumerationOptions)0
+                                                                errorHandler:NULL];
+    for (NSURL *url in fileEnumerator) {
+        @autoreleasepool {
+            [self.fileManager removeItemAtURL:url error:nil];
+        }
+    }
 }
 
 - (void)removeDataForKey:(nonnull NSString *)key {
@@ -81,11 +90,28 @@ static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hac
 
 - (void)removeExpiredData {
     NSDate *expirationDate = [NSDate dateWithTimeIntervalSinceNow:-self.config.maxDiskAge];
-    for (NSString *fileName in [self.fileManager enumeratorAtPath:self.cachePath]) {
-        NSString *filePath = [self.cachePath stringByAppendingPathComponent:fileName];
-        NSDate *modificationDate = [[self.fileManager attributesOfItemAtPath:filePath error:nil] objectForKey:NSFileModificationDate];
-        if ([[modificationDate laterDate:expirationDate] isEqualToDate:expirationDate]) {
-            [self.fileManager removeItemAtPath:filePath error:nil];
+    NSURL *diskCacheURL = [NSURL fileURLWithPath:self.cachePath isDirectory:YES];
+    NSArray<NSString *> *resourceKeys = @[NSURLIsDirectoryKey, NSURLContentAccessDateKey];
+    NSDirectoryEnumerator<NSURL *> *fileEnumerator = [self.fileManager enumeratorAtURL:diskCacheURL
+                                                   includingPropertiesForKeys:resourceKeys
+                                                                      options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                 errorHandler:NULL];
+    
+    for (NSURL *fileURL in fileEnumerator) {
+        @autoreleasepool {
+            NSError *error;
+            NSDictionary<NSString *, id> *resourceValues = [fileURL resourceValuesForKeys:resourceKeys error:&error];
+            
+            // Skip directories and errors.
+            if (error || !resourceValues || [resourceValues[NSURLIsDirectoryKey] boolValue]) {
+                continue;;
+            }
+            
+            // Remove files that are older than the expiration date;
+            NSDate *accessDate = resourceValues[NSURLContentAccessDateKey];
+            if (expirationDate && [[accessDate laterDate:expirationDate] isEqualToDate:expirationDate]) {
+                [self.fileManager removeItemAtURL:fileURL error:nil];
+            }
         }
     }
 }
@@ -95,14 +121,29 @@ static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hac
 }
 
 - (NSUInteger)totalCount {
-    return [self.fileManager contentsOfDirectoryAtPath:self.cachePath error:nil].count;
+    NSUInteger count = 0;
+    @autoreleasepool {
+        count = [self.fileManager contentsOfDirectoryAtPath:self.cachePath error:nil].count;
+    }
+    return count;
 }
 
 - (NSUInteger)totalSize {
     NSUInteger size = 0;
-    for (NSString *fileName in [self.fileManager enumeratorAtPath:self.cachePath]) {
-        NSString *filePath = [self.cachePath stringByAppendingPathComponent:fileName];
-        size += [[[self.fileManager attributesOfItemAtPath:filePath error:nil] objectForKey:NSFileSize] unsignedIntegerValue];
+    @autoreleasepool {
+        NSURL *pathURL = [NSURL fileURLWithPath:self.cachePath isDirectory:YES];
+        NSDirectoryEnumerator<NSURL *> *fileEnumerator = [self.fileManager enumeratorAtURL:pathURL
+                                                  includingPropertiesForKeys:@[NSURLFileSizeKey]
+                                                                     options:(NSDirectoryEnumerationOptions)0
+                                                                errorHandler:NULL];
+        
+        for (NSURL *fileURL in fileEnumerator) {
+            @autoreleasepool {
+                NSNumber *fileSize;
+                [fileURL getResourceValue:&fileSize forKey:NSURLFileSizeKey error:NULL];
+                size += fileSize.unsignedIntegerValue;
+            }
+        }
     }
     return size;
 }
@@ -119,6 +160,177 @@ static NSString * const SDWebImageTestDiskCacheExtendedAttributeName = @"com.hac
     } else {
         [SDFileAttributeHelper setExtendedAttribute:SDWebImageTestDiskCacheExtendedAttributeName value:extendedData atPath:cachePathForKey traverseLink:NO overwrite:YES error:nil];
     }
+}
+
+@end
+
+@implementation SDWebImageTestCache
+
++ (SDWebImageTestCache *)sharedCache {
+    static dispatch_once_t onceToken;
+    static SDWebImageTestCache *cache;
+    dispatch_once(&onceToken, ^{
+        NSString *cachePath = [[self userCacheDirectory] stringByAppendingPathComponent:@"SDWebImageTestCache"];
+        SDImageCacheConfig *config = SDImageCacheConfig.defaultCacheConfig;
+        cache = [[SDWebImageTestCache alloc] initWithCachePath:cachePath config:config];
+    });
+    return cache;
+}
+
+- (instancetype)initWithCachePath:(NSString *)cachePath config:(SDImageCacheConfig *)config {
+    self = [super init];
+    if (self) {
+        self.config = config;
+        self.memoryCache = [[SDWebImageTestMemoryCache alloc] initWithConfig:config];
+        self.diskCache = [[SDWebImageTestDiskCache alloc] initWithCachePath:cachePath config:config];
+    }
+    return self;
+}
+
+- (void)clearWithCacheType:(SDImageCacheType)cacheType completion:(nullable SDWebImageNoParamsBlock)completionBlock {
+    switch (cacheType) {
+        case SDImageCacheTypeNone:
+            break;
+        case SDImageCacheTypeMemory:
+            [self.memoryCache removeAllObjects];
+            break;
+        case SDImageCacheTypeDisk:
+            [self.diskCache removeAllData];
+            break;
+        case SDImageCacheTypeAll:
+            [self.memoryCache removeAllObjects];
+            [self.diskCache removeAllData];
+            break;
+        default:
+            break;
+    }
+    if (completionBlock) {
+        completionBlock();
+    }
+}
+
+- (void)containsImageForKey:(nullable NSString *)key cacheType:(SDImageCacheType)cacheType completion:(nullable SDImageCacheContainsCompletionBlock)completionBlock {
+    SDImageCacheType containsCacheType = SDImageCacheTypeNone;
+    switch (cacheType) {
+        case SDImageCacheTypeNone:
+            break;
+        case SDImageCacheTypeMemory:
+            containsCacheType = [self.memoryCache objectForKey:key] ? SDImageCacheTypeMemory : SDImageCacheTypeNone;
+            break;
+        case SDImageCacheTypeDisk:
+            containsCacheType = [self.diskCache containsDataForKey:key] ? SDImageCacheTypeDisk : SDImageCacheTypeNone;
+            break;
+        case SDImageCacheTypeAll:
+            if ([self.memoryCache objectForKey:key]) {
+                containsCacheType = SDImageCacheTypeMemory;
+            } else if ([self.diskCache containsDataForKey:key]) {
+                containsCacheType = SDImageCacheTypeDisk;
+            }
+            break;
+        default:
+            break;
+    }
+    if (completionBlock) {
+        completionBlock(containsCacheType);
+    }
+}
+
+- (nullable id<SDWebImageOperation>)queryImageForKey:(nullable NSString *)key options:(SDWebImageOptions)options context:(nullable SDWebImageContext *)context completion:(nullable SDImageCacheQueryCompletionBlock)completionBlock {
+    return [self queryImageForKey:key options:options context:context cacheType:SDImageCacheTypeAll completion:completionBlock];
+}
+
+- (nullable id<SDWebImageOperation>)queryImageForKey:(nullable NSString *)key options:(SDWebImageOptions)options context:(nullable SDWebImageContext *)context cacheType:(SDImageCacheType)cacheType completion:(nullable SDImageCacheQueryCompletionBlock)completionBlock {
+    UIImage *image;
+    NSData *data;
+    SDImageCacheType resultCacheType = SDImageCacheTypeNone;
+    switch (cacheType) {
+        case SDImageCacheTypeNone:
+            break;
+        case SDImageCacheTypeMemory:
+            image = [self.memoryCache objectForKey:key];
+            if (image) {
+                resultCacheType = SDImageCacheTypeMemory;
+            }
+            break;
+        case SDImageCacheTypeDisk:
+            data = [self.diskCache dataForKey:key];
+            image = [UIImage sd_imageWithData:data];
+            if (data) {
+                resultCacheType = SDImageCacheTypeDisk;
+            }
+            break;
+        case SDImageCacheTypeAll:
+            image = [self.memoryCache objectForKey:key];
+            if (image) {
+                resultCacheType = SDImageCacheTypeMemory;
+            } else {
+                data = [self.diskCache dataForKey:key];
+                image = [UIImage sd_imageWithData:data];
+                if (data) {
+                    resultCacheType = SDImageCacheTypeDisk;
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    if (completionBlock) {
+        completionBlock(image, data, resultCacheType);
+    }
+    return nil;
+}
+
+- (void)removeImageForKey:(nullable NSString *)key cacheType:(SDImageCacheType)cacheType completion:(nullable SDWebImageNoParamsBlock)completionBlock {
+    switch (cacheType) {
+        case SDImageCacheTypeNone:
+            break;
+        case SDImageCacheTypeMemory:
+            [self.memoryCache removeObjectForKey:key];
+            break;
+        case SDImageCacheTypeDisk:
+            [self.diskCache removeDataForKey:key];
+            break;
+        case SDImageCacheTypeAll:
+            [self.memoryCache removeObjectForKey:key];
+            [self.diskCache removeDataForKey:key];
+            break;
+        default:
+            break;
+    }
+    if (completionBlock) {
+        completionBlock();
+    }
+}
+
+- (void)storeImage:(nullable UIImage *)image imageData:(nullable NSData *)imageData forKey:(nullable NSString *)key cacheType:(SDImageCacheType)cacheType completion:(nullable SDWebImageNoParamsBlock)completionBlock {
+    [self storeImage:image imageData:imageData forKey:key options:0 context:nil cacheType:cacheType completion:completionBlock];
+}
+
+- (void)storeImage:(nullable UIImage *)image imageData:(nullable NSData *)imageData forKey:(nullable NSString *)key options:(SDWebImageOptions)options context:(nullable SDWebImageContext *)context cacheType:(SDImageCacheType)cacheType completion:(nullable SDWebImageNoParamsBlock)completionBlock {
+    switch (cacheType) {
+        case SDImageCacheTypeNone:
+            break;
+        case SDImageCacheTypeMemory:
+            [self.memoryCache setObject:image forKey:key];
+            break;
+        case SDImageCacheTypeDisk:
+            [self.diskCache setData:imageData forKey:key];
+            break;
+        case SDImageCacheTypeAll:
+            [self.memoryCache setObject:image forKey:key];
+            [self.diskCache setData:imageData forKey:key];
+            break;
+        default:
+            break;
+    }
+    if (completionBlock) {
+        completionBlock();
+    }
+}
+
++ (nullable NSString *)userCacheDirectory {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    return paths.firstObject;
 }
 
 @end
